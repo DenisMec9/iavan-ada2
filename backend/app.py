@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import numpy as np
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -25,6 +27,8 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 
 MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 METRIC = os.getenv("SEARCH_METRIC", "ip").lower()
+EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "local").lower()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 app = FastAPI(title="AV02 Similarity Search API", version="1.0.0")
 
@@ -96,6 +100,50 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def get_encoder() -> EmbeddingEncoder:
+    encoder = getattr(app.state, "encoder", None)
+    if encoder is None:
+        app.state.encoder = EmbeddingEncoder(MODEL_NAME)
+    return app.state.encoder
+
+
+def _embed_query_hf_api(query: str) -> np.ndarray:
+    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{MODEL_NAME}"
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    payload = {
+        "inputs": query,
+        "options": {"wait_for_model": True},
+    }
+    response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Embedding API error ({response.status_code}).",
+        )
+
+    data = response.json()
+    arr = np.array(data, dtype="float32")
+    if arr.ndim == 1:
+        vec = arr
+    elif arr.ndim == 2:
+        vec = arr.mean(axis=0)
+    elif arr.ndim == 3:
+        vec = arr[0].mean(axis=0)
+    else:
+        raise HTTPException(status_code=503, detail="Invalid embedding response format.")
+    return vec.reshape(1, -1).astype("float32")
+
+
+def embed_query(query: str) -> np.ndarray:
+    if EMBEDDING_BACKEND == "hf_api":
+        return _embed_query_hf_api(query)
+    encoder = get_encoder()
+    return encoder.encode([query], batch_size=1)
 
 
 def _count_bad_chars(text: str) -> int:
@@ -239,7 +287,7 @@ def startup_event() -> None:
 
     app.state.index = load_index(str(INDEX_PATH))
     app.state.metadata = read_jsonl(CHUNKS_PATH)
-    app.state.encoder = EmbeddingEncoder(MODEL_NAME)
+    app.state.encoder = None
 
 
 @app.get("/api/health")
@@ -249,6 +297,8 @@ def health() -> dict[str, Any]:
         "chunks_loaded": len(app.state.metadata),
         "metric": METRIC,
         "model": MODEL_NAME,
+        "embedding_backend": EMBEDDING_BACKEND,
+        "encoder_loaded": app.state.encoder is not None,
     }
 
 
@@ -261,7 +311,7 @@ def search(
     if not query:
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    query_vec = app.state.encoder.encode([query], batch_size=1)
+    query_vec = embed_query(query)
     if METRIC == "ip":
         query_vec = l2_normalize(query_vec)
 

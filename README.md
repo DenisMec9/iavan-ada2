@@ -88,6 +88,10 @@ Depois abra: `http://localhost:8000`
 - `--model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
 - `--urls-file data/urls_mpc.txt`
 
+Para deploy no Render free (evitar OOM):
+- `EMBEDDING_BACKEND=hf_api`
+- `MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+
 ## Observacoes importantes
 - Algumas paginas podem bloquear scraping ou renderizar conteudo via JavaScript.
 - Se uma URL falhar, ela sera ignorada e o pipeline continua.
