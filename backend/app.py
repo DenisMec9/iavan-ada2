@@ -9,7 +9,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
-import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -25,10 +24,8 @@ INDEX_PATH = DATA_DIR / "index" / "faiss.index"
 CHUNKS_PATH = DATA_DIR / "processed" / "chunks.jsonl"
 FRONTEND_DIR = BASE_DIR / "frontend"
 
-MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+MODEL_NAME = os.getenv("MODEL_NAME", "sentence-transformers/paraphrase-multilingual-MiniLM-L3-v2")
 METRIC = os.getenv("SEARCH_METRIC", "ip").lower()
-EMBEDDING_BACKEND = os.getenv("EMBEDDING_BACKEND", "local").lower()
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 app = FastAPI(title="AV02 Similarity Search API", version="1.0.0")
 
@@ -55,6 +52,55 @@ SOURCE_TYPE_LABELS = {
     "release-oficial": "Fonte oficial",
     "materia-critica": "Fonte jornalistica",
     "site-web": "Fonte web",
+}
+
+QUERY_STOPWORDS = {
+    "a",
+    "ao",
+    "aos",
+    "as",
+    "com",
+    "como",
+    "da",
+    "das",
+    "de",
+    "do",
+    "dos",
+    "e",
+    "em",
+    "na",
+    "nas",
+    "no",
+    "nos",
+    "o",
+    "os",
+    "ou",
+    "para",
+    "por",
+    "pra",
+    "que",
+    "qual",
+    "quais",
+    "quando",
+    "quem",
+    "se",
+    "sem",
+    "sobre",
+    "um",
+    "uma",
+    "the",
+    "of",
+    "in",
+    "on",
+    "to",
+    "and",
+    "is",
+    "are",
+    "what",
+    "who",
+    "where",
+    "why",
+    "how",
 }
 
 MOJIBAKE_REPLACEMENTS = {
@@ -109,39 +155,7 @@ def get_encoder() -> EmbeddingEncoder:
     return app.state.encoder
 
 
-def _embed_query_hf_api(query: str) -> np.ndarray:
-    api_url = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{MODEL_NAME}"
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if HF_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_TOKEN}"
-
-    payload = {
-        "inputs": query,
-        "options": {"wait_for_model": True},
-    }
-    response = requests.post(api_url, headers=headers, json=payload, timeout=60)
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Embedding API error ({response.status_code}).",
-        )
-
-    data = response.json()
-    arr = np.array(data, dtype="float32")
-    if arr.ndim == 1:
-        vec = arr
-    elif arr.ndim == 2:
-        vec = arr.mean(axis=0)
-    elif arr.ndim == 3:
-        vec = arr[0].mean(axis=0)
-    else:
-        raise HTTPException(status_code=503, detail="Invalid embedding response format.")
-    return vec.reshape(1, -1).astype("float32")
-
-
 def embed_query(query: str) -> np.ndarray:
-    if EMBEDDING_BACKEND == "hf_api":
-        return _embed_query_hf_api(query)
     encoder = get_encoder()
     return encoder.encode([query], batch_size=1)
 
@@ -208,6 +222,97 @@ def _relevance_label(score: float) -> str:
     if score >= 0.32:
         return "media"
     return "moderada"
+
+
+def _tokenize_for_match(text: str) -> set[str]:
+    clean = _clean_text(text).lower()
+    tokens = re.findall(r"[a-z0-9à-ÿ]+", clean)
+    return {
+        token
+        for token in tokens
+        if len(token) >= 3 and token not in QUERY_STOPWORDS and not token.isdigit()
+    }
+
+
+def _normalize_scores(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    min_score = min(scores)
+    max_score = max(scores)
+    span = max_score - min_score
+    if span <= 1e-8:
+        return [1.0] * len(scores)
+    return [(score - min_score) / span for score in scores]
+
+
+def _rerank_and_diversify(
+    query: str,
+    raw_results: list[dict[str, Any]],
+    top_k: int,
+    max_per_url: int = 2,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if not raw_results:
+        return [], None
+
+    query_tokens = _tokenize_for_match(query)
+    dense_scores = [float(row.get("score", 0.0)) for row in raw_results]
+    dense_norm = _normalize_scores(dense_scores)
+
+    enriched: list[dict[str, Any]] = []
+    for row, dense_score in zip(raw_results, dense_norm):
+        doc_text = f"{row.get('title', '')} {row.get('text', '')}"
+        doc_tokens = _tokenize_for_match(doc_text)
+        lexical = 0.0
+        if query_tokens:
+            lexical = len(query_tokens & doc_tokens) / max(1, len(query_tokens))
+
+        combined = (0.78 * dense_score) + (0.22 * lexical)
+        enriched.append(
+            {
+                **row,
+                "_dense_norm": dense_score,
+                "_lexical": lexical,
+                "_combined": combined,
+            }
+        )
+
+    ranked = sorted(
+        enriched,
+        key=lambda row: (row["_combined"], float(row.get("score", 0.0))),
+        reverse=True,
+    )
+
+    top_raw_score = float(ranked[0].get("score", 0.0))
+    best_lexical_top10 = max(row["_lexical"] for row in ranked[:10])
+    if top_raw_score < 0.24 and best_lexical_top10 < 0.12:
+        return [], "Pergunta parece fora do tema da base (MPC/Papatinho)."
+
+    selected: list[dict[str, Any]] = []
+    per_url_counter: dict[str, int] = {}
+    deferred: list[dict[str, Any]] = []
+    for row in ranked:
+        url = str(row.get("url", ""))
+        used = per_url_counter.get(url, 0)
+        if used >= max_per_url:
+            deferred.append(row)
+            continue
+        selected.append(row)
+        per_url_counter[url] = used + 1
+        if len(selected) >= top_k:
+            break
+
+    if len(selected) < top_k:
+        for row in deferred:
+            selected.append(row)
+            if len(selected) >= top_k:
+                break
+
+    for row in selected:
+        row.pop("_dense_norm", None)
+        row.pop("_lexical", None)
+        row.pop("_combined", None)
+
+    return selected[:top_k], None
 
 
 def _build_excerpt(text: str, query: str, max_chars: int = 360) -> str:
@@ -297,7 +402,6 @@ def health() -> dict[str, Any]:
         "chunks_loaded": len(app.state.metadata),
         "metric": METRIC,
         "model": MODEL_NAME,
-        "embedding_backend": EMBEDDING_BACKEND,
         "encoder_loaded": app.state.encoder is not None,
     }
 
@@ -315,15 +419,23 @@ def search(
     if METRIC == "ip":
         query_vec = l2_normalize(query_vec)
 
-    raw_results = search_top_k(app.state.index, query_vec, app.state.metadata, top_k=top_k * 2)
-    presented = [_present_result(row, query) for row in raw_results]
+    candidate_k = min(len(app.state.metadata), max(top_k * 8, 20))
+    raw_results = search_top_k(app.state.index, query_vec, app.state.metadata, top_k=candidate_k)
+    reranked_raw, notice = _rerank_and_diversify(query, raw_results, top_k=top_k)
+    presented = [_present_result(row, query) for row in reranked_raw]
     results = [row for row in presented if not _is_low_quality_text(row.get("excerpt", ""))]
     if not results:
         results = presented
     results = results[:top_k]
     for i, row in enumerate(results, start=1):
         row["rank"] = i
-    return {"query": query, "top_k": top_k, "count": len(results), "results": results}
+    return {
+        "query": query,
+        "top_k": top_k,
+        "count": len(results),
+        "results": results,
+        "notice": notice,
+    }
 
 
 @app.get("/")

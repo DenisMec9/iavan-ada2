@@ -58,8 +58,18 @@ function renderResults(items) {
 }
 
 async function search(query, topK) {
-  const params = new URLSearchParams({ q: query, top_k: String(topK) });
-  const res = await fetch(`/api/search?${params.toString()}`);
+  const params = new URLSearchParams({
+    q: query,
+    top_k: String(topK),
+    _ts: String(Date.now()),
+  });
+  const res = await fetch(`/api/search?${params.toString()}`, {
+    cache: "no-store",
+    headers: {
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+    },
+  });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || "Erro na busca");
@@ -83,7 +93,8 @@ form.addEventListener("submit", async (event) => {
 
   try {
     const data = await search(query, topK);
-    statusEl.textContent = `${data.count} resultado(s) para: "${query}"`;
+    const notice = data.notice ? ` | ${data.notice}` : "";
+    statusEl.textContent = `${data.count} resultado(s) para: "${query}"${notice}`;
     renderResults(data.results || []);
   } catch (error) {
     statusEl.textContent = error.message || "Erro inesperado.";
