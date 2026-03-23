@@ -1,0 +1,9 @@
+# MPC / Papatinho corpus seeds
+# You can add or remove URLs. Keep between 3 and 10 pages for AV02.
+
+https://www.universalmusic.com.br/2025/06/05/papatinho-apresenta-mpc-musica-popular-carioca-e-inaugura-um-novo-capitulo-do-funk-brasileiro/
+https://www.universalmusic.com.br/2025/06/04/papatinho-firma-parceria-com-a-universal-music-brasil-e-anuncia-nova-fase-com-o-projeto-mpc-musica-popular-carioca/
+https://billboard.com.br/papatinho-o-mago-carioca-das-producoes-contemporaneas/
+https://billboard.com.br/grammy-latino-papatinho-explica-a-magica-da-musica-popular-carioca/
+https://www.aqueletuim.com.br/2025/06/critica-mpc-musica-popular-carioca.html
+https://pt.wikipedia.org/wiki/Papatinho

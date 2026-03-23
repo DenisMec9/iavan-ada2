@@ -1,0 +1,14 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual env
+.venv/
+venv/
+
+# Local bundles and temporary artifacts
+deploy_bundle/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
